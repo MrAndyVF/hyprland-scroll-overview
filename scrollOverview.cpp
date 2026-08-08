@@ -199,18 +199,13 @@ static bool hasApplicableScrollKeybind(const IPointer::SAxisEvent& event) {
     else
         return false;
 
-    const auto MODS    = g_pInputManager->getModsFromAllKBs();
-    const auto SUBMAP  = Keybinds::mgr()->currentSubmap();
-    const auto MATCHES = std::ranges::any_of(Keybinds::mgr()->registry().binds(), [&](const auto& keybind) {
+    const auto MODS   = g_pInputManager->getModsFromAllKBs();
+    const auto SUBMAP = Keybinds::mgr()->currentSubmap();
+    return std::ranges::any_of(Keybinds::mgr()->registry().binds(), [&](const auto& keybind) {
         return keybind && keybind->enabled() && !Keybinds::mgr()->m_shadowed.contains(keybind) && std::ranges::contains(keybind->keyNames(), key) &&
             (keybind->modifierMask() == MODS || keybind->hasFlag(Keybinds::BIND_FLAG_IGNORE_MODS)) &&
             (keybind->metadata().submap == SUBMAP || keybind->hasFlag(Keybinds::BIND_FLAG_SUBMAP_UNIVERSAL));
     });
-
-    if (MATCHES)
-        g_pendingMouseAxisBindTimeMs = event.timeMs;
-
-    return MATCHES;
 }
 
 static bool scrollKeybindIsThrottled() {
@@ -1505,8 +1500,11 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
             return;
 
         if (usesSubmapKeybinds && isOverviewSubmapActive() && hasApplicableScrollKeybind(e)) {
-            if (scrollKeybindIsThrottled())
+            if (scrollKeybindIsThrottled()) {
+                g_pendingMouseAxisBindTimeMs.reset();
                 info.cancelled = true;
+            } else
+                g_pendingMouseAxisBindTimeMs = e.timeMs;
             return;
         }
 
