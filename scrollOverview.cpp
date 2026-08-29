@@ -2785,7 +2785,7 @@ std::optional<CScrollOverview::SWindowDragSnapshot> CScrollOverview::snapshotNat
         .window       = WINDOW,
         .workspace    = WINDOW->m_workspace,
         .box          = BOX,
-        .visualBox    = WINDOW->m_group ? BOX : WINDOW->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT),
+        .visualBox    = WINDOW->grouping().group() ? BOX : WINDOW->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT),
         .floatSize    = TARGET->lastFloatingSize(),
         .startedTiled = dragController->draggingTiled(),
     };
@@ -5090,7 +5090,7 @@ void CScrollOverview::close(ECloseMode mode) {
 
     if (PRESERVEMONITORSTATE) {
         closeOnWindow.reset();
-        focusSyncedFromWorkspaceID = WORKSPACE_INVALID;
+        focusSyncedFromWorkspaceKey.clear();
         startedOn                  = SELECTEDWORKSPACE;
         viewportCurrentWorkspace   = activeWorkspaceIndex();
         viewOffset->setValueAndWarp(Vector2D{});
