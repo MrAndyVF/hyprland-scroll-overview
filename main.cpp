@@ -39,7 +39,7 @@ static CFunctionHook* g_pScrollSendFrameEventsHook = nullptr;
 static CFunctionHook* g_pScrollSurfaceFrameHook    = nullptr;
 static CFunctionHook* g_pScrollMoveMouseHook       = nullptr;
 static CFunctionHook* g_pScrollChangeWorkspaceHook = nullptr;
-typedef void (*origRenderWorkspace)(void*, PHLMONITOR, PHLWORKSPACE, const Time::steady_tp&, const CBox&);
+typedef void (*origRenderWorkspace)(void*, Render::CRenderContext&, PHLMONITOR, PHLWORKSPACE, const Time::steady_tp&, const CBox&);
 typedef void (*origAddDamageA)(void*, const CBox&);
 typedef void (*origAddDamageB)(void*, const pixman_region32_t*);
 typedef void (*origDamageSurface)(void*, SP<CWLSurfaceResource>, double, double, double);
@@ -155,10 +155,10 @@ static void hkScheduleFrame(void* thisptr, Aquamarine::IOutput::scheduleFrameRea
 }
 
 //
-static void hkRenderWorkspace(void* thisptr, PHLMONITOR pMonitor, PHLWORKSPACE pWorkspace, const Time::steady_tp& now, const CBox& geometry) {
+static void hkRenderWorkspace(void* thisptr, Render::CRenderContext& ctx, PHLMONITOR pMonitor, PHLWORKSPACE pWorkspace, const Time::steady_tp& now, const CBox& geometry) {
     const auto OVERVIEW = scrollOverviewForMonitor(pMonitor);
     if (!OVERVIEW || renderingOverview)
-        rc<origRenderWorkspace>(g_pScrollRenderWorkspaceHook->m_original)(thisptr, pMonitor, pWorkspace, now, geometry);
+        rc<origRenderWorkspace>(g_pScrollRenderWorkspaceHook->m_original)(thisptr, ctx, pMonitor, pWorkspace, now, geometry);
     else {
         const bool PREVRENDERINGOVERVIEW = renderingOverview;
         const auto PREVRENDERINGMONITOR  = renderingOverviewMonitor;
@@ -712,7 +712,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    g_pHyprRenderer->m_renderPass.removeAllOfType("CScrollOverviewPassElement");
+    Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).removeAllOfType("CScrollOverviewPassElement");
 
     g_unloading = true;
     g_nativeDragMouseMoveHook.reset();
