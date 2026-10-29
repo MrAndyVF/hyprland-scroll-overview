@@ -1815,21 +1815,21 @@ void CScrollOverview::updateBackdropBlurCache(PHLMONITOR monitor, int wallpaperM
     backdropBlurDirty = false;
 }
 
-void CScrollOverview::renderBackdropBlurCache(PHLMONITOR monitor) {
-    if (!monitor || !backdropBlurFB || !backdropBlurFB->isAllocated() || !backdropBlurFB->getTexture())
+void CScrollOverview::renderBackdropBlurCache(PHLMONITOR monitor, float alpha) {
+    if (!monitor || !backdropBlurFB || !backdropBlurFB->isAllocated() || !backdropBlurFB->getTexture() || alpha <= 0.F)
         return;
 
     const auto TEX = backdropBlurFB->getTexture();
     const CRegion fullDamage{CBox{0, 0, monitor->m_transformedSize.x, monitor->m_transformedSize.y}};
 
-    g_pHyprRenderer->draw(g_pHyprRenderer->context(),
-        CTexPassElement::SRenderData{
+    // Queued (not drawn immediately) so it lands above the sharp wallpaper queued before it.
+    Render::IHyprRenderer::currentPass(g_pHyprRenderer->context())
+        .add(makeUnique<CTexPassElement>(CTexPassElement::SRenderData{
             .tex    = TEX,
             .box    = CBox{0, 0, monitor->m_transformedSize.x, monitor->m_transformedSize.y},
-            .a      = 1.F,
+            .a      = alpha,
             .damage = fullDamage,
-        },
-        fullDamage);
+        }));
 }
 
 static void focusOverviewFullscreenWindowIfActiveWorkspace(const PHLWINDOW& fullscreenWindow_, const PHLWORKSPACE& workspace, PHLMONITOR monitor) {
@@ -5399,10 +5399,15 @@ void CScrollOverview::render() {
 
     if (ScrollOverview::Config::getBlur(pMonitor.lock()) && WALLPAPERMODE != 1) {
         updateBackdropBlurCache(MONITOR, WALLPAPERMODE, NOW);
-        if (backdropBlurFB && backdropBlurFB->isAllocated() && backdropBlurFB->getTexture())
-            renderBackdropBlurCache(MONITOR);
-        else
+        // Fade the blur with the zoom so it is gone exactly when the desktop is back at scale 1,
+        // instead of popping off once the close animation fully settles.
+        const auto TARGETSCALE = ScrollOverview::Config::getScale(MONITOR);
+        const auto BLURALPHA   = TARGETSCALE < 0.999F ? std::clamp((1.F - SCALE) / (1.F - TARGETSCALE), 0.F, 1.F) : 1.F;
+        const bool HASBLURCACHE = backdropBlurFB && backdropBlurFB->isAllocated() && backdropBlurFB->getTexture();
+        if (!HASBLURCACHE || BLURALPHA < 1.F)
             renderGlobalWallpaper(MONITOR, NOW);
+        if (HASBLURCACHE)
+            renderBackdropBlurCache(MONITOR, BLURALPHA);
     } else if (WALLPAPERMODE == 0 || WALLPAPERMODE == 2) {
         renderGlobalWallpaper(MONITOR, NOW);
     } else
