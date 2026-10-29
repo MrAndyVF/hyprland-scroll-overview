@@ -14,6 +14,7 @@ class CScrollOverviewPassElement : public IPassElement {
     }
     bool                          needsLiveBlur(Render::CRenderContext& ctx) override;
     bool                          needsPrecomputeBlur(Render::CRenderContext& ctx) override;
+    bool                          disableSimplification(Render::CRenderContext& ctx) override;
     std::optional<CBox>           boundingBox(Render::CRenderContext& ctx) override;
     CRegion                       opaqueRegion(Render::CRenderContext& ctx) override;
 

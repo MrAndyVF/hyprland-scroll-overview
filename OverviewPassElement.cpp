@@ -106,20 +106,18 @@ bool CScrollOverviewPassElement::needsPrecomputeBlur(Render::CRenderContext& ctx
     return false;
 }
 
-std::optional<CBox> CScrollOverviewPassElement::boundingBox(Render::CRenderContext& ctx) {
-    const auto overview = activeScrollOverview();
-    if (!overview || !overview->pMonitor)
-        return std::nullopt;
+// Pass occlusion uses unscaled surface boxes, so scaled overview surfaces would
+// hide whatever is drawn below them (e.g. the global wallpaper without blur).
+bool CScrollOverviewPassElement::disableSimplification(Render::CRenderContext& ctx) {
+    return true;
+}
 
-    return CBox{{}, overview->pMonitor->m_size};
+std::optional<CBox> CScrollOverviewPassElement::boundingBox(Render::CRenderContext& ctx) {
+    return std::nullopt;
 }
 
 CRegion CScrollOverviewPassElement::opaqueRegion(Render::CRenderContext& ctx) {
-    const auto overview = activeScrollOverview();
-    if (!overview || !overview->pMonitor)
-        return CRegion{};
-
-    return CBox{{}, overview->pMonitor->m_size};
+    return {};
 }
 
 COverviewShadowPassElement::COverviewShadowPassElement(const SData& data_) : data(data_) {

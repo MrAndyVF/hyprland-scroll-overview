@@ -1,4 +1,5 @@
 #include "OverviewRender.hpp"
+#include "OverviewPassElement.hpp"
 #include <chrono>
 #include <cmath>
 #include <sstream>
@@ -15,6 +16,7 @@ void flushPass(PHLMONITOR monitor) {
     if (pass.empty())
         return;
 
+    pass.add(makeUnique<CScrollOverviewPassElement>());
     pass.render(g_pHyprRenderer->context(), CRegion{CBox{{}, monitor->m_transformedSize}});
     pass.clear();
 }

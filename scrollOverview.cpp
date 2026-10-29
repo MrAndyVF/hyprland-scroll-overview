@@ -5453,6 +5453,8 @@ void CScrollOverview::render() {
         }
     }
 
+    Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).add(makeUnique<CScrollOverviewPassElement>());
+
     sendOverviewFrameCallbacks(NOW);
 }
 
