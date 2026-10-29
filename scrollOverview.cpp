@@ -4258,7 +4258,8 @@ void CScrollOverview::renderWorkspaceBackground(PHLMONITOR monitor, size_t works
 
     renderOverviewWorkspaceShadow(monitor, WORKSPACEBOX, renderScale, wallpaperMode == 0, WORKSPACEALPHA);
 
-    if (ScrollOverview::Config::getBlur(pMonitor.lock()) && wallpaperMode != 1 && WORKSPACEALPHA > 0.001F)
+    // Only behind a card wallpaper; with global-only wallpaper it'd show a second blur box over the backdrop.
+    if (ScrollOverview::Config::getBlur(pMonitor.lock()) && wallpaperMode == 2 && WORKSPACEALPHA > 0.001F)
         OverviewRender::queueBlur(g_pHyprRenderer->context(), WORKSPACEBOX, 0, 2.F, WORKSPACEALPHA, false);
 
     if (wallpaperMode != 0 && WORKSPACEALPHA > 0.001F)
