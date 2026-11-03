@@ -8,16 +8,16 @@
 
 namespace OverviewRender {
 
-void flushPass(PHLMONITOR monitor) {
+void flushPass(Render::CRenderContext& ctx, PHLMONITOR monitor) {
     if (!monitor)
         return;
 
-    auto& pass = Render::IHyprRenderer::currentPass(g_pHyprRenderer->context());
+    auto& pass = Render::IHyprRenderer::currentPass(ctx);
     if (pass.empty())
         return;
 
     pass.add(makeUnique<CScrollOverviewPassElement>());
-    pass.render(g_pHyprRenderer->context(), CRegion{CBox{{}, monitor->m_transformedSize}});
+    pass.render(ctx, CRegion{CBox{{}, monitor->m_transformedSize}});
     pass.clear();
 }
 
@@ -44,7 +44,7 @@ void renderBlur(Render::CRenderContext& ctx, PHLMONITOR monitor, const CBox& box
         return;
 
     queueBlur(ctx, box, rounding, roundingPower, alpha, usePrecomputedBlur);
-    flushPass(monitor);
+    flushPass(ctx, monitor);
 }
 
 }

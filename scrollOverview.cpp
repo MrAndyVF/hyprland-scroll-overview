@@ -16,10 +16,10 @@
 #define private public
 #define protected public
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/render/SceneResources.hpp>
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/config/ConfigManager.hpp>
-#include <hyprland/src/config/lua/ConfigManager.hpp>
 #include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include <hyprland/src/config/shared/animation/AnimationTree.hpp>
 #include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
@@ -64,7 +64,6 @@
 #include <hyprland/src/render/decorations/CHyprGroupBarDecoration.hpp>
 #include <hyprland/src/render/decorations/DecorationPositioner.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
-#include <hyprutils/string/Numeric.hpp>
 #undef protected
 #undef private
 #include "Config.hpp"
@@ -163,6 +162,24 @@ void removeOverview(IOverview* overview_) {
         PMONITOR->recheckSolitary();
         g_pHyprRenderer->damageMonitor(PMONITOR);
     }
+}
+
+// Removing the overview destroys it, so it is done from an idle source, once
+// the caller has unwound. The caller may still be using the overview: the
+// animation manager calls scale's onUpdate() right after its end callback.
+void CScrollOverview::scheduleCloseRemoval() {
+    if (closeRemovalIdle)
+        return;
+
+    closeRemovalIdle = wl_event_loop_add_idle(
+        g_pCompositor->m_wlEventLoop,
+        [](void* data) {
+            auto* const overview = sc<CScrollOverview*>(data);
+            overview->closeRemovalIdle = nullptr;
+            if (overview->closing && overview->closeRemovalPending && !overview->dragCancelledAwaitingRelease)
+                removeOverview(overview);
+        },
+        this);
 }
 
 static xkb_keysym_t getOverviewKeysym(const IKeyboard::SKeyEvent& event) {
@@ -707,9 +724,14 @@ static SOverviewShadowConfig getOverviewShadowConfig(PHLMONITOR monitor) {
     };
 }
 
-static void renderOverviewWorkspaceShadow(PHLMONITOR monitor, const CBox& workspaceBox, float overviewScale, bool cutoutCenter, float alpha = 1.F) {
+static void renderOverviewWorkspaceShadow(PHLMONITOR monitor, const CBox& workspaceBox, float overviewScale, float alpha = 1.F) {
     if (!monitor)
         return;
+
+    // Fade the card's shadow continuously between the desktop and overview,
+    // including when a gesture reverses before reaching either endpoint.
+    const auto progress = std::clamp((1.F - overviewScale) / (1.F - ScrollOverview::Config::getScale(monitor)), 0.F, 1.F);
+    alpha *= progress * progress * (3.F - 2.F * progress);
 
     const auto SHADOW = getOverviewShadowConfig(monitor);
     const bool HASVISIBLECOLOR = std::ranges::any_of(SHADOW.color.m_colors, [](const CHyprColor& color) { return color.a > 0.F; });
@@ -734,7 +756,7 @@ static void renderOverviewWorkspaceShadow(PHLMONITOR monitor, const CBox& worksp
         .renderPower   = SHADOW.renderPower,
         .color         = SHADOW.color,
         .alpha         = alpha,
-        .ignoreWindow  = cutoutCenter,
+        .ignoreWindow  = false,
     }));
 }
 
@@ -1206,6 +1228,11 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
         if (info.cancelled)
             return;
 
+        // Extra buttons have no built-in overview action. Let Hyprland handle
+        // their bindings, including press/release and other bind flags.
+        if (event.button != BTN_LEFT && event.button != BTN_RIGHT && event.button != BTN_MIDDLE)
+            return;
+
         // If a native drag was not adopted, Hyprland must receive its release.
         if (!g_pointerGrabOverview && g_layoutManager && g_layoutManager->dragController()->target())
             return;
@@ -1227,16 +1254,8 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
         const bool RELEASESPOINTERGRAB = event.state == WL_POINTER_BUTTON_STATE_RELEASED;
         auto       releasePointerGrab  = Hyprutils::Utils::CScopeGuard([this, RELEASESPOINTERGRAB] {
             if (RELEASESPOINTERGRAB && g_pointerGrabOverview == this) {
-                if (dragCancelledAwaitingRelease && closing && closeRemovalPending && !scale->isBeingAnimated() && !closeRemovalIdle)
-                    closeRemovalIdle = wl_event_loop_add_idle(
-                        g_pCompositor->m_wlEventLoop,
-                        [](void* data) {
-                            auto* const overview = sc<CScrollOverview*>(data);
-                            overview->closeRemovalIdle = nullptr;
-                            if (overview->closing && overview->closeRemovalPending && !overview->dragCancelledAwaitingRelease)
-                                removeOverview(overview);
-                        },
-                        this);
+                if (dragCancelledAwaitingRelease && closing && closeRemovalPending && !scale->isBeingAnimated())
+                    scheduleCloseRemoval();
 
                 dragCancelledAwaitingRelease = false;
                 dragAdoptedFromNative        = false;
@@ -1650,7 +1669,8 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
                 moveSelection("down");
                 break;
             case XKB_KEY_Return:
-            case XKB_KEY_KP_Enter: closeAll(); break;
+            case XKB_KEY_KP_Enter:
+            case XKB_KEY_Escape: closeAll(); break;
             default: return;
         }
 
@@ -1737,17 +1757,17 @@ void CScrollOverview::renderWallpaperLayers(PHLMONITOR monitor, const CBox& work
     renderOverviewLayerLevel(monitor, ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, workspaceBox, renderScale, now, alpha);
 }
 
-void CScrollOverview::renderGlobalWallpaper(PHLMONITOR monitor, const Time::steady_tp& now) {
+void CScrollOverview::renderGlobalWallpaper(Render::CRenderContext& ctx, PHLMONITOR monitor, const Time::steady_tp& now) {
     if (!monitor)
         return;
 
-    g_pHyprRenderer->renderBackground(g_pHyprRenderer->context(), monitor);
+    g_pHyprRenderer->renderBackground(ctx, monitor);
 
     for (auto const& ls : monitor->m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND]) {
         if (!Desktop::View::validMapped(ls.lock()))
             continue;
 
-        g_pHyprRenderer->renderLayer(g_pHyprRenderer->context(), ls.lock(), monitor, now);
+        g_pHyprRenderer->renderLayer(ctx, ls.lock(), monitor, now);
     }
 }
 
@@ -1760,9 +1780,14 @@ void CScrollOverview::updateBackdropBlurCache(PHLMONITOR monitor, int wallpaperM
         lastBackdropWallpaperMode = wallpaperMode;
     }
 
+    auto&      monitorContext = g_pHyprRenderer->context();
+    if (!monitorContext.m_data.currentFB)
+        return;
+
     const auto FBSIZE     = monitor->m_transformedSize;
     const auto RENDERSIZE = monitor->m_transformedSize;
-    const auto FBFORMAT   = g_pHyprRenderer->context().m_data.currentFB->m_drmFormat;
+    const auto FBFORMAT  = monitorContext.m_data.currentFB->m_drmFormat;
+    const auto DESC      = NColorManagement::getDefaultImageDescription();
     if (!backdropBlurFB)
         backdropBlurFB = g_pHyprRenderer->createFB("scrolloverview_backdrop_blur");
 
@@ -1774,36 +1799,62 @@ void CScrollOverview::updateBackdropBlurCache(PHLMONITOR monitor, int wallpaperM
         backdropBlurDirty = true;
     }
 
+    if (backdropBlurFB->imageDescription() != DESC)
+        backdropBlurDirty = true;
+
     if (!backdropBlurDirty)
         return;
 
-    if (g_pHyprRenderer->context().m_data.currentFB)
-        backdropBlurFB->setImageDescription(g_pHyprRenderer->context().m_data.currentFB->imageDescription());
+    // Cache the wallpaper and blur before monitor HDR mapping. Reusing an HDR work-buffer
+    // texture skips CM when compositing it, copying HDR values into the SDR mirror as well.
+    // An explicit SDR scene also keeps the blur provider's scratch buffers in this space.
+    backdropBlurFB->setImageDescription(DESC);
+    auto resources = makeShared<Render::CSceneResources>(nullptr, Render::SSceneBufferDescription{.format = FBFORMAT, .imageDescription = DESC});
+    Render::CRenderContext cacheContext;
+    if (!cacheContext.begin(resources))
+        return;
+
+    cacheContext.m_data                 = monitorContext.m_data;
+    cacheContext.m_data.mainFB          = backdropBlurFB;
+    cacheContext.m_data.outFB           = backdropBlurFB;
+    cacheContext.m_data.renderModif     = {};
+    cacheContext.m_data.clipBox         = {};
+    cacheContext.m_data.currentWindow.reset();
+    cacheContext.m_data.surface.reset();
+    cacheContext.m_mode                 = Render::RENDER_MODE_TO_BUFFER_READ_ONLY;
+    cacheContext.m_blockSurfaceFeedback = true;
+
+    // Keep source buffers alive until the enclosing monitor frame has finished using them.
+    auto transferBufferUses = Hyprutils::Utils::CScopeGuard([&] {
+        for (auto& buffer : cacheContext.m_usedAsyncBuffers)
+            monitorContext.m_usedAsyncBuffers.emplace_back(std::move(buffer));
+        cacheContext.m_usedAsyncBuffers.clear();
+    });
 
     const CRegion fullDamage{CBox{0, 0, RENDERSIZE.x, RENDERSIZE.y}};
 
     {
-        auto bindBackdrop = g_pHyprRenderer->bindTempFB(g_pHyprRenderer->context(), backdropBlurFB);
-        g_pHyprRenderer->draw(g_pHyprRenderer->context(), CClearPassElement::SClearData{CHyprColor{0.F, 0.F, 0.F, 1.F}}, fullDamage);
-        renderGlobalWallpaper(monitor, now);
-        OverviewRender::flushPass(monitor);
+        auto bindBackdrop = g_pHyprRenderer->bindTempFB(cacheContext, backdropBlurFB);
+        g_pHyprRenderer->draw(cacheContext, CClearPassElement::SClearData{CHyprColor{0.F, 0.F, 0.F, 1.F}}, fullDamage);
+        renderGlobalWallpaper(cacheContext, monitor, now);
+        OverviewRender::flushPass(cacheContext, monitor);
     }
 
     auto         blurDamage = fullDamage;
     SP<Render::ITexture> BLURREDTEX;
     {
-        auto bindBackdrop = g_pHyprRenderer->bindTempFB(g_pHyprRenderer->context(), backdropBlurFB);
-        const auto blurredFB = g_pHyprRenderer->blurMainFramebuffer(g_pHyprRenderer->context(), 1.F, blurDamage);
+        auto bindBackdrop = g_pHyprRenderer->bindTempFB(cacheContext, backdropBlurFB);
+        const auto blurredFB = g_pHyprRenderer->blurMainFramebuffer(cacheContext, 1.F, blurDamage);
         BLURREDTEX = blurredFB ? blurredFB->getTexture() : nullptr;
     }
     if (!BLURREDTEX || !BLURREDTEX->m_size.x || !BLURREDTEX->m_size.y)
         return;
 
     {
-        auto bindBackdrop = g_pHyprRenderer->bindTempFB(g_pHyprRenderer->context(), backdropBlurFB);
-        g_pHyprRenderer->draw(g_pHyprRenderer->context(), CClearPassElement::SClearData{CHyprColor{0.F, 0.F, 0.F, 0.F}}, fullDamage);
+        auto bindBackdrop = g_pHyprRenderer->bindTempFB(cacheContext, backdropBlurFB);
+        g_pHyprRenderer->draw(cacheContext, CClearPassElement::SClearData{CHyprColor{0.F, 0.F, 0.F, 0.F}}, fullDamage);
 
-        g_pHyprRenderer->draw(g_pHyprRenderer->context(),
+        g_pHyprRenderer->draw(cacheContext,
             CTexPassElement::SRenderData{
                 .tex    = BLURREDTEX,
                 .box    = CBox{0, 0, RENDERSIZE.x, RENDERSIZE.y},
@@ -1936,8 +1987,8 @@ void CScrollOverview::rebuildWorkspaceImages() {
 
     images.clear();
 
-    for (const auto& w : State::workspaceState()->workspacesCopy()) {
-        const auto& WORKSPACE = w;
+    for (const auto& w : State::workspaceState()->workspaces()) {
+        const auto WORKSPACE = w.lock();
         if (!valid(WORKSPACE) || WORKSPACE->m_monitor != pMonitor || WORKSPACE->type() == Workspace::eWorkspaceType::SPECIAL)
             continue;
 
@@ -4256,7 +4307,7 @@ void CScrollOverview::renderWorkspaceBackground(PHLMONITOR monitor, size_t works
         workspace->m_forceRendering = WASFORCERENDERING;
     });
 
-    renderOverviewWorkspaceShadow(monitor, WORKSPACEBOX, renderScale, wallpaperMode == 0, WORKSPACEALPHA);
+    renderOverviewWorkspaceShadow(monitor, WORKSPACEBOX, renderScale, WORKSPACEALPHA);
 
     // Only behind a card wallpaper; with global-only wallpaper it'd show a second blur box over the backdrop.
     if (ScrollOverview::Config::getBlur(pMonitor.lock()) && wallpaperMode == 2 && WORKSPACEALPHA > 0.001F)
@@ -4342,7 +4393,7 @@ void CScrollOverview::renderWorkspaceLive(PHLMONITOR monitor, size_t workspaceId
 
     if (!scrollingLayout && hasFullscreenPath) {
         renderOverviewWindow(fullscreenWindow);
-        OverviewRender::flushPass(monitor);
+        OverviewRender::flushPass(g_pHyprRenderer->context(), monitor);
         for (const auto& windowRef : workspaceImage->windows) {
             const auto window = getOverviewWindowToShow(windowRef.lock());
             if (!shouldShowOverviewWindow(window) || !window->isFloating() || window == fullscreenWindow)
@@ -5085,6 +5136,14 @@ void CScrollOverview::close(ECloseMode mode) {
     const bool PRESERVEMONITORSTATE = mode == ECloseMode::PRESERVE_MONITOR_STATE;
     const bool ACTIVATESELECTION    = !PRESERVEMONITORSTATE && activeScrollOverview().get() == this;
     const auto MONITOR              = pMonitor.lock();
+    // DPMS/output replacement may leave an overview referring to a monitor
+    // that no longer exists. Retire it without touching workspace state.
+    if (!MONITOR) {
+        closing = true;
+        closeRemovalPending = true;
+        scheduleCloseRemoval();
+        return;
+    }
     const auto SELECTEDWORKSPACE    = PRESERVEMONITORSTATE ?
         (MONITOR ? MONITOR->m_activeWorkspace : PHLWORKSPACE{}) :
         (viewportCurrentWorkspace < images.size() && images[viewportCurrentWorkspace] ? images[viewportCurrentWorkspace]->pWorkspace : PHLWORKSPACE{});
@@ -5112,7 +5171,7 @@ void CScrollOverview::close(ECloseMode mode) {
         closeRemovalPending = true;
         scale->setCallbackOnEnd([this](auto) {
             if (!dragCancelledAwaitingRelease)
-                removeOverview(this);
+                scheduleCloseRemoval();
         });
     };
 
@@ -5234,9 +5293,27 @@ void CScrollOverview::reopen() {
         return;
 
     scale->setCallbackOnEnd({});
+    if (closeRemovalIdle) {
+        wl_event_source_remove(closeRemovalIdle);
+        closeRemovalIdle = nullptr;
+    }
     closeApplied        = false;
     closeRemovalPending = false;
     setClosing(false);
+
+    // When all monitors were closing, the shared state may still belong to a
+    // closing instance. Let it hand ownership to an open overview again.
+    for (const auto& overview : scrollOverviews()) {
+        auto* owner = overview ? dynamic_cast<CScrollOverview*>(overview.get()) : nullptr;
+        if (owner && owner->sharedStateOwner && owner->closing) {
+            owner->transferSharedStateOwnership();
+            break;
+        }
+    }
+
+    usesSubmapKeybinds = hasOverviewSubmap();
+    if (usesSubmapKeybinds)
+        keyboardKeyHook.reset();
     activateSubmapIfConfigured();
     emitFullscreenVisibilityState(Desktop::focusState()->window(), true);
     *scale = ScrollOverview::Config::getScale(pMonitor.lock());
@@ -5405,11 +5482,11 @@ void CScrollOverview::render() {
         const auto BLURALPHA   = TARGETSCALE < 0.999F ? std::clamp((1.F - SCALE) / (1.F - TARGETSCALE), 0.F, 1.F) : 1.F;
         const bool HASBLURCACHE = backdropBlurFB && backdropBlurFB->isAllocated() && backdropBlurFB->getTexture();
         if (!HASBLURCACHE || BLURALPHA < 1.F)
-            renderGlobalWallpaper(MONITOR, NOW);
+            renderGlobalWallpaper(g_pHyprRenderer->context(), MONITOR, NOW);
         if (HASBLURCACHE)
             renderBackdropBlurCache(MONITOR, BLURALPHA);
     } else if (WALLPAPERMODE == 0 || WALLPAPERMODE == 2) {
-        renderGlobalWallpaper(MONITOR, NOW);
+        renderGlobalWallpaper(g_pHyprRenderer->context(), MONITOR, NOW);
     } else
         g_pHyprRenderer->draw(g_pHyprRenderer->context(), CClearPassElement::SClearData{CHyprColor{0.F, 0.F, 0.F, 1.F}}, {});
 
@@ -5425,7 +5502,7 @@ void CScrollOverview::render() {
         const auto GHOSTBOX     = getOverviewWorkspaceBox(MONITOR, SCALE, viewOffset->value(), GHOSTOFFSET, layout);
 
         if (GHOSTALPHA > 0.001F && overviewBoxIntersectsMonitor(GHOSTBOX, MONITOR)) {
-            renderOverviewWorkspaceShadow(MONITOR, GHOSTBOX, SCALE, WALLPAPERMODE == 0, GHOSTALPHA);
+            renderOverviewWorkspaceShadow(MONITOR, GHOSTBOX, SCALE, GHOSTALPHA);
 
             if (WALLPAPERMODE != 0)
                 renderWallpaperLayers(MONITOR, GHOSTBOX, SCALE, NOW, GHOSTALPHA);
@@ -5438,7 +5515,7 @@ void CScrollOverview::render() {
     if (NEEDS_PRECOMPUTED_BLUR && overviewBlurDirty)
         Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).add(makeUnique<CPreBlurElement>());
 
-    OverviewRender::flushPass(MONITOR);
+    OverviewRender::flushPass(g_pHyprRenderer->context(), MONITOR);
 
     if (NEEDS_PRECOMPUTED_BLUR)
         overviewBlurDirty = false;
@@ -5553,6 +5630,9 @@ bool CScrollOverview::dispatchSubmapMouseClick(uint32_t button) {
     if (KEYBIND == BINDS.end())
         return false;
 
+    // Keep the callback alive if it removes its own binding.
+    const auto BIND = *KEYBIND;
+
     auto&      actionState          = *Config::Actions::state();
     const int PREVIOUSPASSPRESSED   = actionState.m_passPressed;
     const int PREVIOUSDEPTH         = actionState.m_bindInvocationDepth;
@@ -5569,7 +5649,7 @@ bool CScrollOverview::dispatchSubmapMouseClick(uint32_t button) {
         actionState.m_lastMouseCode       = PREVIOUSMOUSECODE;
     });
 
-    const auto RESULT = (*KEYBIND)->invoke();
+    const auto RESULT = BIND->invoke();
     return RESULT.success;
 }
 
