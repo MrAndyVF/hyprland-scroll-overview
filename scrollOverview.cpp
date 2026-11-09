@@ -3,6 +3,7 @@
 #include <any>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <functional>
 #include <limits>
@@ -377,11 +378,15 @@ static CBox getOverviewGlobalBox(CBox globalBox, PHLMONITOR monitor, float scale
 }
 
 static CBox getOverviewWindowBox(const PHLWINDOW& window, PHLMONITOR monitor, float scale, const Vector2D& viewOffset, float offset, ScrollOverview::Config::ELayout layout,
-                                 bool round = true) {
+                                 bool round = true, bool includeDecorations = true) {
     if (!window)
         return {};
 
-    return getOverviewGlobalBox(window->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT), monitor, scale, viewOffset, offset, layout, round);
+    auto box = window->geometricBox(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+    if (includeDecorations && g_pDecorationPositioner && window->m_ruleApplicator->decorate().valueOrDefault())
+        box.addExtents(g_pDecorationPositioner->getWindowDecorationExtents(window, true));
+
+    return getOverviewGlobalBox(box, monitor, scale, viewOffset, offset, layout, round);
 }
 
 static CBox getOverviewDragWindowBox(const PHLWINDOW& window, PHLMONITOR monitor, float scale, const Vector2D& viewOffset, float offset, ScrollOverview::Config::ELayout layout,
@@ -393,7 +398,7 @@ static CBox getOverviewDragWindowBox(const PHLWINDOW& window, PHLMONITOR monitor
     if (window->grouping().group() && TARGET)
         return getOverviewGlobalBox(TARGET->position(), monitor, scale, viewOffset, offset, layout, round);
 
-    return getOverviewWindowBox(window, monitor, scale, viewOffset, offset, layout, round);
+    return getOverviewWindowBox(window, monitor, scale, viewOffset, offset, layout, round, false);
 }
 
 static CBox expandOverviewWindowHitbox(CBox box, float scale, float monitorScale) {
@@ -452,22 +457,24 @@ static CBox getWorkspaceGlobalBox(PHLWORKSPACE workspace, PHLMONITOR fallbackMon
     return {MONITOR->m_position, MONITOR->m_size};
 }
 
-static CBox centerBoxInWorkspace(CBox box, PHLWORKSPACE workspace, PHLMONITOR fallbackMonitor) {
+static CBox centerBoxInWorkspace(CBox box, PHLWORKSPACE workspace, PHLMONITOR fallbackMonitor, const SBoxExtents& extents = {}) {
     const auto WORKSPACEBOX = getWorkspaceGlobalBox(workspace, fallbackMonitor);
     if (WORKSPACEBOX.width <= 0 || WORKSPACEBOX.height <= 0)
         return box;
 
+    box.addExtents(extents);
     box.x = WORKSPACEBOX.x + std::max(0.F, sc<float>(WORKSPACEBOX.width - box.width)) / 2.F;
     box.y = WORKSPACEBOX.y + std::max(0.F, sc<float>(WORKSPACEBOX.height - box.height)) / 2.F;
 
-    return box;
+    return box.addExtents(extents * -1.0);
 }
 
-static CBox clampBoxToWorkspace(CBox box, PHLWORKSPACE workspace, PHLMONITOR fallbackMonitor, float margin = 0.F) {
+static CBox clampBoxToWorkspace(CBox box, PHLWORKSPACE workspace, PHLMONITOR fallbackMonitor, float margin = 0.F, const SBoxExtents& extents = {}) {
     const auto WORKSPACEBOX = getWorkspaceGlobalBox(workspace, fallbackMonitor);
     if (WORKSPACEBOX.width <= 0 || WORKSPACEBOX.height <= 0)
         return box;
 
+    box.addExtents(extents);
     const float CLAMPMARGIN = std::max(0.F, margin);
     const float MINX        = WORKSPACEBOX.x + CLAMPMARGIN;
     const float MINY        = WORKSPACEBOX.y + CLAMPMARGIN;
@@ -477,7 +484,7 @@ static CBox clampBoxToWorkspace(CBox box, PHLWORKSPACE workspace, PHLMONITOR fal
     box.x = std::clamp(sc<float>(box.x), MINX, std::max(MINX, MAXX));
     box.y = std::clamp(sc<float>(box.y), MINY, std::max(MINY, MAXY));
 
-    return box;
+    return box.addExtents(extents * -1.0);
 }
 
 static CBox resizedOverviewBoxFromCorner(const CBox& originalBox, const Vector2D& delta, Layout::eRectCorner corner, const Vector2D& minSizePx,
@@ -1712,15 +1719,128 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
     syncSelectionToViewport();
 }
 
-static void renderOverviewLayerLevel(PHLMONITOR monitor, uint32_t layer, const CBox& workspaceBox, float renderScale, const Time::steady_tp& now, float alpha = 1.F) {
+// A layer surface is a wallpaper candidate when it covers the whole monitor and reserves no exclusive zone.
+// Everything else on the BACKGROUND and BOTTOM layers is a widget and is drawn per card.
+// Layer geometry comes from m_geometry (the arrangeLayersForMonitor() result), not logicalBox(). logicalBox()
+// returns nullopt for surfaces with no input region or zero alpha, which would hide a valid wallpaper.
+static bool layerSurfaceCoversMonitor(const PHLLS& ls, PHLMONITOR monitor) {
+    // m_geometry is in global layout coordinates, so compare against the monitor's position, not the origin.
+    const CBox& GEOM = ls->m_geometry;
+    constexpr double EPSILON = 0.5;
+    return std::abs(GEOM.x - monitor->m_position.x) < EPSILON && std::abs(GEOM.y - monitor->m_position.y) < EPSILON && GEOM.w + EPSILON >= monitor->m_size.x &&
+        GEOM.h + EPSILON >= monitor->m_size.y;
+}
+
+static int32_t layerSurfaceExclusiveZone(const PHLLS& ls) {
+    const auto RESOURCE = ls->m_layerSurface.lock();
+    return RESOURCE ? RESOURCE->m_current.exclusive : 0;
+}
+
+static bool wallpaperDebugEnabled() {
+    static const bool ENABLED = [] {
+        const char* value = std::getenv("SCROLLOVERVIEW_DEBUG_WALLPAPER");
+        return value && *value && std::string_view{value} != "0";
+    }();
+    return ENABLED;
+}
+
+static std::unordered_map<std::string, std::string> s_lastWallpaperDebugLog;
+
+static void logWallpaperDetection(PHLMONITOR monitor, const std::vector<PHLLS>& wallpapers) {
+    const auto describe = [](const PHLLS& ls) {
+        const CBox& BOX  = ls->m_geometry;
+        const auto  GEOM = std::format("{:.0f},{:.0f} {:.0f}x{:.0f}", BOX.x, BOX.y, BOX.w, BOX.h);
+        return std::format("'{}' layer={} geom={} exclusive={}", ls->m_namespace, ls->m_layer, GEOM, layerSurfaceExclusiveZone(ls));
+    };
+
+    std::string summary = "wallpapers:";
+    for (const auto& ls : wallpapers)
+        summary += std::format(" [{}]", describe(ls));
+
+    summary += " widgets:";
+    for (const auto LAYER : {ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM}) {
+        for (const auto& ref : monitor->m_layerSurfaceLayers[LAYER]) {
+            const auto ls = ref.lock();
+            if (!Desktop::View::validMapped(ls) || std::find(wallpapers.begin(), wallpapers.end(), ls) != wallpapers.end())
+                continue;
+            summary += std::format(" [{}]", describe(ls));
+        }
+    }
+
+    auto& last = s_lastWallpaperDebugLog[monitor->m_name];
+    if (last == summary)
+        return;
+
+    last = summary;
+    std::fprintf(stderr, "[scrolloverview] monitor %s %s\n", monitor->m_name.c_str(), summary.c_str());
+}
+
+static std::vector<PHLLS> detectWallpaperSurfaces(PHLMONITOR monitor) {
+    std::vector<PHLLS> wallpapers;
+    if (!monitor)
+        return wallpapers;
+
+    const auto LAYERCFG      = ScrollOverview::Config::getWallpaperLayer(monitor);
+    const bool SCANBACKGROUND = LAYERCFG != ScrollOverview::Config::EWallpaperLayer::BOTTOM;
+    const bool SCANBOTTOM     = LAYERCFG != ScrollOverview::Config::EWallpaperLayer::BACKGROUND;
+
+    for (const auto LAYER : {ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM}) {
+        if ((LAYER == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND && !SCANBACKGROUND) || (LAYER == ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM && !SCANBOTTOM))
+            continue;
+
+        for (const auto& ref : monitor->m_layerSurfaceLayers[LAYER]) {
+            const auto ls = ref.lock();
+            if (!Desktop::View::validMapped(ls) || !layerSurfaceCoversMonitor(ls, monitor) || layerSurfaceExclusiveZone(ls) > 0)
+                continue;
+
+            wallpapers.emplace_back(ls);
+        }
+    }
+
+    if (wallpaperDebugEnabled())
+        logWallpaperDetection(monitor, wallpapers);
+
+    return wallpapers;
+}
+
+static bool isWallpaperSurface(const PHLLS& ls, PHLMONITOR monitor) {
+    const auto WALLPAPERS = detectWallpaperSurfaces(monitor);
+    return std::find(WALLPAPERS.begin(), WALLPAPERS.end(), ls) != WALLPAPERS.end();
+}
+
+// Widgets are every mapped BACKGROUND or BOTTOM surface that is not part of the wallpaper stack.
+static std::vector<PHLLS> collectOverviewWidgets(PHLMONITOR monitor) {
+    std::vector<PHLLS> widgets;
+    if (!monitor)
+        return widgets;
+
+    const auto WALLPAPERS = detectWallpaperSurfaces(monitor);
+    for (const auto LAYER : {ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM}) {
+        for (const auto& ref : monitor->m_layerSurfaceLayers[LAYER]) {
+            const auto ls = ref.lock();
+            if (!Desktop::View::validMapped(ls) || std::find(WALLPAPERS.begin(), WALLPAPERS.end(), ls) != WALLPAPERS.end())
+                continue;
+
+            widgets.emplace_back(ls);
+        }
+    }
+
+    return widgets;
+}
+
+static void renderOverviewSurfaces(PHLMONITOR monitor, const std::vector<PHLLS>& surfaces, const CBox& workspaceBox, float renderScale, const Time::steady_tp& now,
+                                   float alpha = 1.F) {
     if (!monitor)
         return;
+
+    // Hyprland culls earlier pass elements under an opaque surface using its unscaled opaque region.
+    // A full-monitor surface would hide anything queued before it (the wallpaper or the global pass), so flush first.
+    OverviewRender::flushPass(g_pHyprRenderer->context(), monitor);
 
     bool pushedRenderHints = false;
     const bool MODULATEALPHA = alpha < 0.999F;
 
-    for (auto const& ls : monitor->m_layerSurfaceLayers[layer]) {
-        const auto LAYER = ls.lock();
+    for (auto const& LAYER : surfaces) {
         if (!Desktop::View::validMapped(LAYER))
             continue;
 
@@ -1748,13 +1868,22 @@ static void renderOverviewLayerLevel(PHLMONITOR monitor, uint32_t layer, const C
 
     if (pushedRenderHints)
         Render::IHyprRenderer::currentPass(g_pHyprRenderer->context()).add(makeUnique<CRendererHintsPassElement>(CRendererHintsPassElement::SData{.renderModif = Render::SRenderModifData{}}));
+
+    OverviewRender::flushPass(g_pHyprRenderer->context(), monitor);
 }
 
 void CScrollOverview::renderWallpaperLayers(PHLMONITOR monitor, const CBox& workspaceBox, float renderScale, const Time::steady_tp& now, float alpha) {
     if (!monitor)
         return;
 
-    renderOverviewLayerLevel(monitor, ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, workspaceBox, renderScale, now, alpha);
+    renderOverviewSurfaces(monitor, detectWallpaperSurfaces(monitor), workspaceBox, renderScale, now, alpha);
+}
+
+void CScrollOverview::renderWidgetLayers(PHLMONITOR monitor, const CBox& workspaceBox, float renderScale, const Time::steady_tp& now, float alpha) {
+    if (!monitor)
+        return;
+
+    renderOverviewSurfaces(monitor, collectOverviewWidgets(monitor), workspaceBox, renderScale, now, alpha);
 }
 
 void CScrollOverview::renderGlobalWallpaper(Render::CRenderContext& ctx, PHLMONITOR monitor, const Time::steady_tp& now) {
@@ -1763,11 +1892,8 @@ void CScrollOverview::renderGlobalWallpaper(Render::CRenderContext& ctx, PHLMONI
 
     g_pHyprRenderer->renderBackground(ctx, monitor);
 
-    for (auto const& ls : monitor->m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND]) {
-        if (!Desktop::View::validMapped(ls.lock()))
-            continue;
-
-        g_pHyprRenderer->renderLayer(ctx, ls.lock(), monitor, now);
+    for (auto const& ls : detectWallpaperSurfaces(monitor)) {
+        g_pHyprRenderer->renderLayer(ctx, ls, monitor, now);
     }
 }
 
@@ -1775,9 +1901,15 @@ void CScrollOverview::updateBackdropBlurCache(PHLMONITOR monitor, int wallpaperM
     if (!monitor || wallpaperMode == 1 || !ScrollOverview::Config::getBlur(pMonitor.lock()))
         return;
 
-    if (lastBackdropWallpaperMode != wallpaperMode) {
-        backdropBlurDirty         = true;
-        lastBackdropWallpaperMode = wallpaperMode;
+    // The cache holds the wallpaper stack, so it must rebuild when the mode or the detected surfaces (or their layers) change.
+    std::vector<std::pair<const void*, uint32_t>> wallpaperStack;
+    for (const auto& ls : detectWallpaperSurfaces(monitor))
+        wallpaperStack.emplace_back(ls.get(), ls->m_layer);
+
+    if (lastBackdropWallpaperMode != wallpaperMode || lastBackdropWallpaperStack != wallpaperStack) {
+        backdropBlurDirty           = true;
+        lastBackdropWallpaperMode   = wallpaperMode;
+        lastBackdropWallpaperStack  = std::move(wallpaperStack);
     }
 
     auto&      monitorContext = g_pHyprRenderer->context();
@@ -2659,7 +2791,8 @@ CBox CScrollOverview::draggedWindowBoxFor(PHLWINDOW window, size_t workspaceIdx,
     const auto WORKSPACEOFFSET = workspaceOverviewOffset(workspaceIdx, activeWorkspaceIndex(), getWorkspaceRenderedPitch(MONITOR, scale->value(), layout));
     auto       box             = getOverviewDragWindowBox(window, MONITOR, scale->value(), viewOffset->value(), WORKSPACEOFFSET, layout);
     box.x = pointLocal.x - box.width * std::clamp(grabRatio.x, 0.0, 1.0);
-    box.y = pointLocal.y - box.height * std::clamp(grabRatio.y, 0.0, 1.0);
+    // A grab on the title bar has a negative offset from the window's content.
+    box.y = pointLocal.y - box.height * std::min(grabRatio.y, 1.0);
     return box;
 }
 
@@ -2681,7 +2814,7 @@ CBox CScrollOverview::draggedWindowGlobalBox() const {
 
     return {
         CURSOR.x - GLOBALSIZE.x * std::clamp(dragGrabRatio.x, 0.0, 1.0),
-        CURSOR.y - GLOBALSIZE.y * std::clamp(dragGrabRatio.y, 0.0, 1.0),
+        CURSOR.y - GLOBALSIZE.y * std::min(dragGrabRatio.y, 1.0),
         GLOBALSIZE.x,
         GLOBALSIZE.y,
     };
@@ -2896,7 +3029,7 @@ void CScrollOverview::beginWindowResize() {
     }
 
     const auto WORKSPACEOFFSET = workspaceOverviewOffset(resizeWorkspaceIdx, activeWorkspaceIndex(), getWorkspaceRenderedPitch(MONITOR, scale->value(), layout));
-    resizeOriginalBox   = getOverviewWindowBox(WINDOW, MONITOR, scale->value(), viewOffset->value(), WORKSPACEOFFSET, layout);
+    resizeOriginalBox   = getOverviewWindowBox(WINDOW, MONITOR, scale->value(), viewOffset->value(), WORKSPACEOFFSET, layout, true, false);
     resizeActiveWindow  = WINDOW;
     resizeLastMouseLocal = lastMousePosLocal;
 
@@ -3321,6 +3454,9 @@ void CScrollOverview::endWindowDrag() {
     if (!WINDOW || !TARGET)
         return;
 
+    const auto DECORATIONEXTENTS = g_pDecorationPositioner && WINDOW->m_ruleApplicator->decorate().valueOrDefault() ?
+        g_pDecorationPositioner->getWindowDecorationExtents(WINDOW, true) : SBoxExtents{};
+
     const auto          targetOverview = scrollOverviewAt(g_pInputManager->getMouseCoordsInternal());
     auto*               dropOverview   = targetOverview ? dynamic_cast<CScrollOverview*>(targetOverview.get()) : nullptr;
 
@@ -3456,9 +3592,8 @@ void CScrollOverview::endWindowDrag() {
         if (TARGET) {
             const auto GLOBALSIZE = DRAGBOX.size() * (1.F / (std::max(dropOverview->scale->value(), 0.01F) * std::max(DROPMONITOR ? DROPMONITOR->m_scale : 1.F, 0.01F)));
             auto       GLOBALBOX  = dropWorkspaceFullyVisible ? CBox{dropOverview->overviewPointToGlobal(dropWorkspaceIdx, DRAGBOX.pos()), GLOBALSIZE} :
-                                                                centerBoxInWorkspace(CBox{Vector2D{}, GLOBALSIZE}, DROPWORKSPACE, DROPMONITOR);
-            if (dropWorkspaceFullyVisible)
-                GLOBALBOX = clampBoxToWorkspace(GLOBALBOX, DROPWORKSPACE, DROPMONITOR, WINDOW->presentation().borderSize());
+                                                                centerBoxInWorkspace(CBox{Vector2D{}, GLOBALSIZE}, DROPWORKSPACE, DROPMONITOR, DECORATIONEXTENTS);
+            GLOBALBOX = clampBoxToWorkspace(GLOBALBOX, DROPWORKSPACE, DROPMONITOR, WINDOW->presentation().borderSize(), DECORATIONEXTENTS);
 
             TARGET->setPositionGlobal(GLOBALBOX);
             TARGET->warpPositionSize();
@@ -3475,7 +3610,7 @@ void CScrollOverview::endWindowDrag() {
         auto       GLOBALBOX  = CBox{GLOBALPOS, GLOBALSIZE};
         const auto WORKSPACE  = workspaceIdx < images.size() && images[workspaceIdx] ? images[workspaceIdx]->pWorkspace : WINDOW->m_workspace;
 
-        GLOBALBOX = clampBoxToWorkspace(GLOBALBOX, WORKSPACE, MONITOR, WINDOW->presentation().borderSize());
+        GLOBALBOX = clampBoxToWorkspace(GLOBALBOX, WORKSPACE, MONITOR, WINDOW->presentation().borderSize(), DECORATIONEXTENTS);
 
         TARGET->damageEntire();
         TARGET->setPositionGlobal(GLOBALBOX);
@@ -3819,6 +3954,33 @@ bool CScrollOverview::moveSelection(const std::string& direction) {
 
     if (!shouldMoveWorkspace && (!closeOnWindow || closeOnWindow->m_workspace != WORKSPACEIMAGE->pWorkspace || !shouldShowOverviewWindow(closeOnWindow.lock()) || closeOnWindow->isFloating())) {
         syncSelectionToViewport();
+
+        // syncSelectionToViewport() can keep (or pick) a floating window, e.g. a small launcher near the
+        // workspace center. Floating windows are never navigation candidates, so starting from one turned
+        // every left/right press into a workspace move. Start from the nearest tiled window instead.
+        if (closeOnWindow && closeOnWindow->isFloating() && closeOnWindow->m_workspace == WORKSPACEIMAGE->pWorkspace) {
+            const auto ORIGIN = closeOnWindow->middle();
+            PHLWINDOW  nearestTiled;
+            double     nearestDistance = std::numeric_limits<double>::max();
+
+            for (const auto& windowRef : WORKSPACEIMAGE->windows) {
+                const auto WINDOW = getOverviewWindowToShow(windowRef.lock());
+                if (!shouldShowOverviewWindow(WINDOW) || WINDOW->isFloating())
+                    continue;
+                if (WINDOW->m_workspace != WORKSPACEIMAGE->pWorkspace || WINDOW->m_monitor != pMonitor)
+                    continue;
+
+                const double DISTANCE = WINDOW->middle().distanceSq(ORIGIN);
+                if (DISTANCE < nearestDistance) {
+                    nearestTiled    = WINDOW;
+                    nearestDistance = DISTANCE;
+                }
+            }
+
+            if (nearestTiled)
+                closeOnWindow = nearestTiled;
+        }
+
         if (!closeOnWindow || closeOnWindow->m_workspace != WORKSPACEIMAGE->pWorkspace || !shouldShowOverviewWindow(closeOnWindow.lock()) || closeOnWindow->isFloating())
             shouldMoveWorkspace = true;
     }
@@ -4317,7 +4479,7 @@ void CScrollOverview::renderWorkspaceBackground(PHLMONITOR monitor, size_t works
         renderWallpaperLayers(monitor, WORKSPACEBOX, renderScale, now, WORKSPACEALPHA);
 
     if (WORKSPACEALPHA >= 0.999F)
-        renderOverviewLayerLevel(monitor, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, WORKSPACEBOX, renderScale, now);
+        renderWidgetLayers(monitor, WORKSPACEBOX, renderScale, now);
 }
 
 void CScrollOverview::renderWorkspaceLive(PHLMONITOR monitor, size_t workspaceIdx, size_t activeIdx, float workspacePitch, float renderScale, int wallpaperMode, const Time::steady_tp& now) {
@@ -4349,7 +4511,7 @@ void CScrollOverview::renderWorkspaceLive(PHLMONITOR monitor, size_t workspaceId
         if (dragActiveWindow && window == getOverviewWindowToShow(dragActiveWindow.lock()))
             return;
 
-        const auto windowBox = getOverviewWindowBox(window, monitor, renderScale, viewOffset->value(), WORKSPACEOFFSET, layout);
+        const auto windowBox = getOverviewWindowBox(window, monitor, renderScale, viewOffset->value(), WORKSPACEOFFSET, layout, true, false);
         if (!overviewBoxIntersectsMonitor(windowBox, monitor))
             return;
 
@@ -5045,7 +5207,7 @@ bool CScrollOverview::shouldHandleSurfaceDamage(SP<CWLSurfaceResource> surface) 
             return false;
 
         markBlurDirty();
-        if (layerOwner->m_layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND)
+        if (isWallpaperSurface(layerOwner, MONITOR))
             markBackdropBlurDirty();
         return true;
     }
@@ -5507,7 +5669,7 @@ void CScrollOverview::render() {
             if (WALLPAPERMODE != 0)
                 renderWallpaperLayers(MONITOR, GHOSTBOX, SCALE, NOW, GHOSTALPHA);
 
-            renderOverviewLayerLevel(MONITOR, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, GHOSTBOX, SCALE, NOW);
+            renderWidgetLayers(MONITOR, GHOSTBOX, SCALE, NOW);
         }
     }
 
